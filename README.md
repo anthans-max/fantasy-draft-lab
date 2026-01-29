@@ -25,4 +25,5 @@ streamlit run ui/app.py
 ## Notes
 
 - No API keys are required.
+- The UI includes a scoring format toggle (PPR vs Half-PPR) that drives all charts.
 - The Draft Advisor tab includes placeholders for a future Gemini-powered explanation.
