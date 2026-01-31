@@ -1,13 +1,14 @@
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import os
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import os
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
 
 from src.scoring import calculate_fantasy_points
 from src.vor import DEFAULT_REPLACEMENT_RANKS, add_draft_round, add_vor
@@ -83,6 +84,57 @@ def add_scoring(df: pd.DataFrame) -> pd.DataFrame:
     df["fantasy_points_per_game_ppr"] = df["fantasy_points_ppr"] / df["games_played"]
     df["fantasy_points_per_game_half_ppr"] = df["fantasy_points_half_ppr"] / df["games_played"]
     return df
+
+
+def build_player_summary(df_filtered: pd.DataFrame, scoring_mode: str) -> pd.DataFrame:
+    if df_filtered.empty:
+        return df_filtered.copy()
+
+    mode = (scoring_mode or "").lower()
+    use_ppr = "ppr" in mode and "half" not in mode
+    points_column = "fantasy_points_ppr" if use_ppr else "fantasy_points_half_ppr"
+    ppg_column = (
+        "fantasy_points_per_game_ppr"
+        if use_ppr
+        else "fantasy_points_per_game_half_ppr"
+    )
+
+    adp_candidates = ["adp_overall", "adp overall", "adp", "adp_pick", "adp_rank", "adp_overall_rank"]
+    adp_column = next((col for col in adp_candidates if col in df_filtered.columns), None)
+
+    agg_map = {
+        "season": "nunique",
+        ppg_column: "mean",
+        points_column: "mean",
+        "games_played": "mean",
+        "touchdowns": "mean",
+        "rushing_yards": "mean",
+        "receiving_yards": "mean",
+        "receptions": "mean",
+    }
+    if adp_column:
+        agg_map[adp_column] = "mean"
+
+    summary = (
+        df_filtered.groupby(["player", "position"], as_index=False)
+        .agg(agg_map)
+        .rename(
+            columns={
+                "season": "seasons_played",
+                ppg_column: "avg_ppg",
+                points_column: "avg_fantasy_points",
+                "games_played": "avg_games",
+                "touchdowns": "avg_touchdowns",
+                "rushing_yards": "avg_rushing_yards",
+                "receiving_yards": "avg_receiving_yards",
+                "receptions": "avg_receptions",
+            }
+        )
+    )
+    if adp_column:
+        summary = summary.rename(columns={adp_column: "avg_adp"})
+
+    return summary.sort_values("avg_ppg", ascending=False)
 
 
 def plot_value_by_round(df: pd.DataFrame, ppg_column: str):
@@ -213,7 +265,66 @@ def main():
         st.subheader("Sample Player Data")
         st.caption(f"Scoring format: {scoring_label}")
         st.write("Using a small, local CSV to power the demo visuals.")
-        st.dataframe(df_view[display_columns], width="stretch")
+        table_view = st.radio(
+            "Table view",
+            ["Player Averages", "Raw Season Data"],
+            index=0,
+            horizontal=True,
+        )
+
+        max_seasons_played = (
+            int(df_view.groupby(["player", "position"])["season"].nunique().max())
+            if not df_view.empty
+            else 1
+        )
+        min_seasons_played = st.number_input(
+            "Min seasons played",
+            min_value=1,
+            max_value=max_seasons_played,
+            value=2,
+            step=1,
+            disabled=table_view == "Raw Season Data",
+        )
+
+        if table_view == "Player Averages":
+            summary = build_player_summary(df_view, scoring_choice)
+            if min_seasons_played > 1:
+                summary = summary[summary["seasons_played"] >= min_seasons_played]
+
+            if summary.empty:
+                st.warning("No players match the current filters.")
+            else:
+                display = summary.rename(
+                    columns={
+                        "player": "Player",
+                        "position": "Pos",
+                        "seasons_played": "Seasons Played",
+                        "avg_ppg": "Avg PPG",
+                        "avg_fantasy_points": "Avg Fantasy Points",
+                        "avg_games": "Avg Games",
+                        "avg_touchdowns": "Avg TDs",
+                        "avg_rushing_yards": "Avg Rush Yds",
+                        "avg_receiving_yards": "Avg Rec Yds",
+                        "avg_receptions": "Avg Receptions",
+                        "avg_adp": "Avg ADP",
+                    }
+                )
+                round_map = {
+                    "Avg PPG": 2,
+                    "Avg Fantasy Points": 1,
+                    "Avg Games": 1,
+                    "Avg TDs": 1,
+                    "Avg Rush Yds": 0,
+                    "Avg Rec Yds": 0,
+                    "Avg Receptions": 1,
+                    "Avg ADP": 1,
+                }
+                display = display.round({k: v for k, v in round_map.items() if k in display.columns})
+                if "Seasons Played" in display.columns:
+                    display["Seasons Played"] = display["Seasons Played"].astype(int)
+                st.dataframe(display, width="stretch")
+        else:
+            st.dataframe(df_view[display_columns], width="stretch")
         st.markdown(
             """
             **Notes**
