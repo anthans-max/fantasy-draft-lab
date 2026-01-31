@@ -22,29 +22,32 @@ LEAGUE_TEAMS = 12
 @st.cache_data(show_spinner="Loading fantasy dataset…")
 def load_fantasy_data() -> pd.DataFrame:
     """
-    Loads fantasy data from Azure Blob Storage (via SAS URL) if configured,
-    otherwise falls back to local sample data for development.
+    Loads fantasy data locally when available, otherwise uses a configured remote URL.
     """
-    url = os.getenv("FANTASY_DATA_URL", "").strip()
-    fmt = os.getenv("FANTASY_DATA_FORMAT", "parquet").strip().lower()
-
-    # Preferred: Blob Storage
-    if url:
-        if fmt == "parquet":
-            return pd.read_parquet(url)
-        elif fmt == "csv":
-            return pd.read_csv(url)
-        else:
-            raise ValueError(f"Unsupported FANTASY_DATA_FORMAT: {fmt}")
-
-    # Fallback: local files (dev-friendly)
-    local_parquet = REPO_ROOT / "data" / "fantasy_players_2019_2025.parquet"
-    local_csv = REPO_ROOT / "data" / "sample_players.csv"
+    repo_root = Path(__file__).resolve().parents[1]
+    local_parquet = repo_root / "data" / "fantasy_players_2019_2025.parquet"
+    local_csv = repo_root / "data" / "sample_players.csv"
 
     if local_parquet.exists() and local_parquet.stat().st_size > 0:
         return pd.read_parquet(local_parquet)
 
-    return pd.read_csv(local_csv)
+    if local_csv.exists() and local_csv.stat().st_size > 0:
+        return pd.read_csv(local_csv)
+
+    url = os.getenv("FANTASY_DATA_URL", "").strip()
+    fmt = os.getenv("FANTASY_DATA_FORMAT", "parquet").strip().lower()
+
+    if url:
+        if fmt == "parquet":
+            return pd.read_parquet(url)
+        if fmt == "csv":
+            return pd.read_csv(url)
+        raise ValueError(f"Unsupported FANTASY_DATA_FORMAT: {fmt}")
+
+    raise RuntimeError(
+        "No local data files found at data/fantasy_players_2019_2025.parquet "
+        "or data/sample_players.csv, and FANTASY_DATA_URL is not set."
+    )
 
 
 
