@@ -12,10 +12,11 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-EXPOSE 8501
+EXPOSE 8000
 
 # Streamlit settings for container environments
-ENV STREAMLIT_SERVER_PORT=8501
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
-CMD ["streamlit", "run", "ui/app.py"]
+CMD ["/bin/sh","-c","streamlit run ui/app.py --server.address=0.0.0.0 --server.port=${WEBSITES_PORT:-${PORT:-8000}} --server.headless=true"]
