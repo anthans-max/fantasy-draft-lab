@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +11,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from src.config import DEFAULT_POSITIONS, normalize_config, scoring_columns
+from src.filters import apply_config_filters
 from src.scoring import calculate_fantasy_points
 from src.vor import DEFAULT_REPLACEMENT_RANKS, add_draft_round, add_vor
 
@@ -60,6 +63,36 @@ def load_players() -> pd.DataFrame:
         ppg_column="fantasy_points_per_game_ppr",
     )
 
+
+
+@st.cache_data(show_spinner="Preparing scoring columns…")
+def load_scored_players() -> pd.DataFrame:
+    return add_scoring(load_players())
+
+
+@st.cache_data(show_spinner="Applying selections…")
+def load_applied_view(
+    scoring_format: str,
+    season_start: int,
+    season_end: int,
+    positions: tuple[str, ...],
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str]:
+    config = {
+        "season_start": season_start,
+        "season_end": season_end,
+        "positions": list(positions),
+    }
+    points_column, ppg_column = scoring_columns(scoring_format)
+    df_filtered = apply_config_filters(load_scored_players(), config)
+
+    df_view = df_filtered.copy()
+    df_view["fantasy_points"] = df_view[points_column]
+    df_view["fantasy_points_per_game"] = df_view[ppg_column]
+    df_view["ppg_delta_ppr_minus_half"] = (
+        df_view["fantasy_points_per_game_ppr"] - df_view["fantasy_points_per_game_half_ppr"]
+    )
+
+    return df_filtered, df_view, points_column, ppg_column
 
 
 def add_scoring(df: pd.DataFrame) -> pd.DataFrame:
@@ -177,74 +210,169 @@ def main():
     st.title("Fantasy Football Draft Analytics")
     st.caption("Demo app for draft value exploration (local CSV data).")
 
-    df = add_scoring(load_players())
+    df = load_scored_players()
     min_season = int(df["season"].min())
     max_season = int(df["season"].max())
+    max_seasons_played = (
+        int(df.groupby(["player", "position"])["season"].nunique().max())
+        if not df.empty
+        else 1
+    )
+
+    default_config = normalize_config(
+        {
+            "scoring_format": "Half-PPR",
+            "season_range": (min_season, max_season),
+            "positions": list(DEFAULT_POSITIONS),
+            "min_seasons_played": 2,
+        },
+        min_season=min_season,
+        max_season=max_season,
+        fallback_positions_to_all=False,
+    )
+    default_config["min_seasons_played"] = min(
+        int(default_config["min_seasons_played"]), max_seasons_played
+    )
+
+    if "pending_config" not in st.session_state:
+        st.session_state["pending_config"] = default_config.copy()
+    else:
+        normalized_pending = normalize_config(
+            st.session_state["pending_config"],
+            min_season=min_season,
+            max_season=max_season,
+            fallback_positions_to_all=False,
+        )
+        normalized_pending["min_seasons_played"] = min(
+            int(normalized_pending["min_seasons_played"]), max_seasons_played
+        )
+        st.session_state["pending_config"] = normalized_pending
+
+    if "applied_config" not in st.session_state:
+        st.session_state["applied_config"] = normalize_config(
+            st.session_state["pending_config"],
+            min_season=min_season,
+            max_season=max_season,
+            fallback_positions_to_all=True,
+        )
+        st.session_state["applied_at"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+    else:
+        normalized_applied = normalize_config(
+            st.session_state["applied_config"],
+            min_season=min_season,
+            max_season=max_season,
+            fallback_positions_to_all=True,
+        )
+        normalized_applied["min_seasons_played"] = min(
+            int(normalized_applied["min_seasons_played"]), max_seasons_played
+        )
+        st.session_state["applied_config"] = normalized_applied
+
+    pending_defaults = st.session_state["pending_config"]
 
     st.sidebar.header("Settings")
+    st.sidebar.caption("Changes are pending until you click Apply selections.")
+
+    scoring_options = ["Half-PPR", "Full PPR"]
     scoring_choice = st.sidebar.radio(
-        "Scoring Format", ["Half-PPR", "Full PPR"], index=0
+        "Scoring Format",
+        scoring_options,
+        index=scoring_options.index(str(pending_defaults["scoring_format"])),
     )
+
     if min_season == max_season:
-        st.sidebar.warning("Only one season found in data; season filter disabled.")
-        season_selection = st.sidebar.selectbox(
-            "Season", [min_season], index=0, disabled=True
-        )
-        season_filter = season_selection
+        st.sidebar.warning("Only one season found in data; season filter is fixed.")
+        st.sidebar.selectbox("Season", [min_season], index=0, disabled=True)
+        season_range = (min_season, max_season)
     else:
         season_range = st.sidebar.slider(
             "Seasons",
             min_value=min_season,
             max_value=max_season,
-            value=(min_season, max_season),
+            value=tuple(pending_defaults["season_range"]),
         )
-        season_filter = season_range
 
+    pending_positions = set(pending_defaults["positions"])
     st.sidebar.subheader("Positions")
     position_flags = {
-        "QB": st.sidebar.checkbox("QB", value=True),
-        "RB": st.sidebar.checkbox("RB", value=True),
-        "WR": st.sidebar.checkbox("WR", value=True),
-        "TE": st.sidebar.checkbox("TE", value=True),
+        "QB": st.sidebar.checkbox("QB", value="QB" in pending_positions),
+        "RB": st.sidebar.checkbox("RB", value="RB" in pending_positions),
+        "WR": st.sidebar.checkbox("WR", value="WR" in pending_positions),
+        "TE": st.sidebar.checkbox("TE", value="TE" in pending_positions),
     }
     selected_positions = [pos for pos, checked in position_flags.items() if checked]
 
-    use_full_ppr = scoring_choice == "Full PPR"
-    scoring_label = "Full PPR" if use_full_ppr else "Half-PPR"
-    position_label = ", ".join(selected_positions) if selected_positions else "None"
-    if isinstance(season_filter, tuple):
-        season_label = f"{season_filter[0]}–{season_filter[1]}"
-    else:
-        season_label = f"{season_filter}"
+    pending_min_seasons = st.sidebar.number_input(
+        "Min seasons played",
+        min_value=1,
+        max_value=max_seasons_played,
+        value=min(int(pending_defaults["min_seasons_played"]), max_seasons_played),
+        step=1,
+    )
+
+    pending_config = normalize_config(
+        {
+            "scoring_format": scoring_choice,
+            "season_range": season_range,
+            "positions": selected_positions,
+            "min_seasons_played": int(pending_min_seasons),
+        },
+        min_season=min_season,
+        max_season=max_season,
+        fallback_positions_to_all=False,
+    )
+    pending_config["min_seasons_played"] = min(
+        int(pending_config["min_seasons_played"]), max_seasons_played
+    )
+    st.session_state["pending_config"] = pending_config
+
+    if st.sidebar.button("Apply selections", type="primary", use_container_width=True):
+        if not pending_config["positions"]:
+            st.sidebar.warning(
+                "No positions selected. Applying all positions (QB, RB, WR, TE)."
+            )
+        applied_config = normalize_config(
+            pending_config,
+            min_season=min_season,
+            max_season=max_season,
+            fallback_positions_to_all=True,
+        )
+        applied_config["min_seasons_played"] = min(
+            int(applied_config["min_seasons_played"]), max_seasons_played
+        )
+        st.session_state["applied_config"] = applied_config
+        st.session_state["applied_at"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        st.rerun()
+
+    applied_config = st.session_state["applied_config"]
+    if pending_config != applied_config:
+        st.sidebar.info("Selections changed. Click Apply selections to refresh all tabs.")
+    if "applied_at" in st.session_state:
+        st.sidebar.caption(f"Applied: {st.session_state['applied_at']}")
+
+    scoring_label = str(applied_config["scoring_format"])
+    season_label = (
+        f"{applied_config['season_start']}–{applied_config['season_end']}"
+        if applied_config["season_start"] != applied_config["season_end"]
+        else f"{applied_config['season_start']}"
+    )
+    position_label = ", ".join(applied_config["positions"])
     st.markdown(
-        f"**Current Settings:** {scoring_label} | Seasons {season_label} | "
-        f"Positions: {position_label}"
+        f"**Applied Settings:** {scoring_label} | Seasons {season_label} | "
+        f"Positions: {position_label} | Min seasons played: {applied_config['min_seasons_played']}"
     )
 
-    if not selected_positions:
-        st.warning("Select at least one position in Settings to view data and charts.")
-        return
-
-    points_column = "fantasy_points_ppr" if use_full_ppr else "fantasy_points_half_ppr"
-    ppg_column = (
-        "fantasy_points_per_game_ppr"
-        if use_full_ppr
-        else "fantasy_points_per_game_half_ppr"
+    df_filtered, df_view, _points_column, ppg_column = load_applied_view(
+        scoring_format=str(applied_config["scoring_format"]),
+        season_start=int(applied_config["season_start"]),
+        season_end=int(applied_config["season_end"]),
+        positions=tuple(applied_config["positions"]),
     )
 
-    if isinstance(season_filter, tuple):
-        season_mask = (df["season"] >= season_filter[0]) & (df["season"] <= season_filter[1])
-    else:
-        season_mask = df["season"] == season_filter
-
-    df_filtered = df[season_mask & (df["position"].isin(selected_positions))].copy()
-
-    df_view = df_filtered.copy()
-    df_view["fantasy_points"] = df_view[points_column]
-    df_view["fantasy_points_per_game"] = df_view[ppg_column]
-    df_view["ppg_delta_ppr_minus_half"] = (
-        df_view["fantasy_points_per_game_ppr"] - df_view["fantasy_points_per_game_half_ppr"]
-    )
     display_columns = [
         "player",
         "position",
@@ -274,28 +402,19 @@ def main():
             index=0,
             horizontal=True,
         )
-
-        max_seasons_played = (
-            int(df_view.groupby(["player", "position"])["season"].nunique().max())
-            if not df_view.empty
-            else 1
-        )
-        min_seasons_played = st.number_input(
-            "Min seasons played",
-            min_value=1,
-            max_value=max_seasons_played,
-            value=2,
-            step=1,
-            disabled=table_view == "Raw Season Data",
-        )
+        min_seasons_played = int(applied_config["min_seasons_played"])
+        st.caption(f"Minimum seasons played filter (applied): {min_seasons_played}")
 
         if table_view == "Player Averages":
-            summary = build_player_summary(df_view, scoring_choice)
+            summary = build_player_summary(df_view, scoring_label)
             if min_seasons_played > 1:
                 summary = summary[summary["seasons_played"] >= min_seasons_played]
 
             if summary.empty:
-                st.warning("No players match the current filters.")
+                st.warning(
+                    "No player averages match the applied selections. Adjust filters in "
+                    "the sidebar and click Apply selections."
+                )
             else:
                 display = summary.rename(
                     columns={
@@ -327,7 +446,13 @@ def main():
                     display["Seasons Played"] = display["Seasons Played"].astype(int)
                 st.dataframe(display, width="stretch")
         else:
-            st.dataframe(df_view[display_columns], width="stretch")
+            if df_view.empty:
+                st.warning(
+                    "No season rows match the applied selections. Adjust filters in the "
+                    "sidebar and click Apply selections."
+                )
+            else:
+                st.dataframe(df_view[display_columns], width="stretch")
         st.markdown(
             """
             **Notes**
@@ -339,18 +464,24 @@ def main():
 
     with tab_charts:
         st.subheader("Charts")
-        st.plotly_chart(
-            plot_value_by_round(df_view, ppg_column).update_layout(
-                title=f"Value by Draft Round (Avg PPG) - {scoring_label}"
-            ),
-            width="stretch",
-        )
-        st.plotly_chart(
-            plot_adp_vs_fppg(df_view, ppg_column).update_layout(
-                title=f"ADP vs PPG - {scoring_label}"
-            ),
-            width="stretch",
-        )
+        if df_view.empty:
+            st.warning(
+                "No chart data for the applied selections. Adjust filters in the sidebar "
+                "and click Apply selections."
+            )
+        else:
+            st.plotly_chart(
+                plot_value_by_round(df_view, ppg_column).update_layout(
+                    title=f"Value by Draft Round (Avg PPG) - {scoring_label}"
+                ),
+                width="stretch",
+            )
+            st.plotly_chart(
+                plot_adp_vs_fppg(df_view, ppg_column).update_layout(
+                    title=f"ADP vs PPG - {scoring_label}"
+                ),
+                width="stretch",
+            )
 
     with tab_vor:
         st.subheader("VOR by Draft Round")
@@ -362,7 +493,10 @@ def main():
         df_vor = add_vor(df_filtered, ppg_column=ppg_column, replacement_ranks=DEFAULT_REPLACEMENT_RANKS)
 
         if df_vor.empty:
-            st.warning("No data available for the current filters.")
+            st.warning(
+                "No VOR results for the applied selections. Adjust filters in the sidebar "
+                "and click Apply selections."
+            )
         else:
             view_choice = st.radio(
                 "Chart view",
@@ -458,30 +592,36 @@ def main():
 
     with tab_advisor:
         st.subheader("Draft Advisor Summary")
-        summary = (
-            df_view.groupby(["draft_round", "position"], as_index=False)[ppg_column]
-            .mean()
-            .rename(columns={ppg_column: "avg_ppg"})
-        )
-        top_values = summary.sort_values("avg_ppg", ascending=False).head(3)
-        top_bullets = [
-            f"Round {int(row.draft_round)} {row.position} (~{row.avg_ppg:.1f} PPG)"
-            for row in top_values.itertuples(index=False)
-        ]
-        st.write(
-            f"""
-            Scoring format: **{scoring_label}**.
+        if df_view.empty:
+            st.warning(
+                "Draft advisor needs applied data first. Adjust filters in the sidebar "
+                "and click Apply selections."
+            )
+        else:
+            summary = (
+                df_view.groupby(["draft_round", "position"], as_index=False)[ppg_column]
+                .mean()
+                .rename(columns={ppg_column: "avg_ppg"})
+            )
+            top_values = summary.sort_values("avg_ppg", ascending=False).head(3)
+            top_bullets = [
+                f"Round {int(row.draft_round)} {row.position} (~{row.avg_ppg:.1f} PPG)"
+                for row in top_values.itertuples(index=False)
+            ]
+            st.write(
+                f"""
+                Scoring format: **{scoring_label}**.
 
-            Based on the computed results, the strongest value pockets by average points per game are:
-            - {top_bullets[0] if len(top_bullets) > 0 else "No data"}
-            - {top_bullets[1] if len(top_bullets) > 1 else "No data"}
-            - {top_bullets[2] if len(top_bullets) > 2 else "No data"}
+                Based on the computed results, the strongest value pockets by average points per game are:
+                - {top_bullets[0] if len(top_bullets) > 0 else "No data"}
+                - {top_bullets[1] if len(top_bullets) > 1 else "No data"}
+                - {top_bullets[2] if len(top_bullets) > 2 else "No data"}
 
-            Use these as a guide: prioritize early-round players at positions showing the highest
-            PPG in your selected scoring format, and look for later-round positions where ADP lags
-            behind per-game output.
-            """
-        )
+                Use these as a guide: prioritize early-round players at positions showing the highest
+                PPG in your selected scoring format, and look for later-round positions where ADP lags
+                behind per-game output.
+                """
+            )
 
         st.markdown("---")
         st.markdown("**Gemini-Powered Explanation (Coming Soon)**")
